@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLibSQL(t *testing.T) {
@@ -16,7 +17,7 @@ func TestLibSQL(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
-	storage, err := NewLibSQL(dbPath)
+	storage, err := NewLibSQL("file:" + dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -28,21 +29,20 @@ func TestLibSQL(t *testing.T) {
 	}
 
 	// Test adding a package
+	now := time.Now()
 	pkg := &Package{
 		Owner:       "owner",
 		Repo:        "repo",
 		Version:     "v1.0.0",
-		InstallPath: "/path/to/binary",
-		BinaryName:  "binary",
+		Binary:      "owner-repo-v1.0.0",
 		Frozen:      false,
+		Platform:    "linux-amd64",
+		InstalledAt: now,
+		UpdatedAt:   now,
 	}
 
 	if err := storage.AddPackage(ctx, pkg); err != nil {
 		t.Fatalf("Failed to add package: %v", err)
-	}
-
-	if pkg.ID == 0 {
-		t.Error("Package ID was not set after adding")
 	}
 
 	// Test getting a package
@@ -71,7 +71,9 @@ func TestLibSQL(t *testing.T) {
 
 	// Test updating a package
 	pkg.Version = "v2.0.0"
+	pkg.Binary = "owner-repo-v2.0.0"
 	pkg.Frozen = true
+	pkg.UpdatedAt = time.Now()
 
 	if err := storage.UpdatePackage(ctx, pkg); err != nil {
 		t.Fatalf("Failed to update package: %v", err)
@@ -111,7 +113,7 @@ func TestLibSQLErrors(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
-	storage, err := NewLibSQL(dbPath)
+	storage, err := NewLibSQL("file:" + dbPath)
 	if err != nil {
 		t.Fatalf("Failed to create storage: %v", err)
 	}
@@ -123,12 +125,15 @@ func TestLibSQLErrors(t *testing.T) {
 	}
 
 	// Test duplicate package
+	now := time.Now()
 	pkg := &Package{
 		Owner:       "owner",
 		Repo:        "repo",
 		Version:     "v1.0.0",
-		InstallPath: "/path/to/binary",
-		BinaryName:  "binary",
+		Binary:      "owner-repo-v1.0.0",
+		Platform:    "linux-amd64",
+		InstalledAt: now,
+		UpdatedAt:   now,
 	}
 
 	if err := storage.AddPackage(ctx, pkg); err != nil {
@@ -144,8 +149,10 @@ func TestLibSQLErrors(t *testing.T) {
 		Owner:       "nonexistent",
 		Repo:        "nonexistent",
 		Version:     "v1.0.0",
-		InstallPath: "/path/to/binary",
-		BinaryName:  "binary",
+		Binary:      "nonexistent-nonexistent-v1.0.0",
+		Platform:    "linux-amd64",
+		InstalledAt: now,
+		UpdatedAt:   now,
 	}
 
 	if err := storage.UpdatePackage(ctx, nonExistentPkg); err == nil {

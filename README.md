@@ -22,9 +22,6 @@ GAAP will mimic the command structure of traditional package managers. Examples:
 # Install a package
 gaap install <repo-name>
 
-# Specify user explicitly
-gaap install <package-name> --user <user>
-
 # Non-interactive install
 gaap install <repo-name> --non-interactive
 
@@ -40,7 +37,6 @@ gaap remove <package-name>
 1. **install**: Fetch and install a package.
 
    - Flags:
-     - `--user`: Specify the repository’s user if not using `user/repo` syntax.
      - `--non-interactive`: Automatically select defaults for any prompts.
      - `--freeze`: Instantly freeze the installed package version.
      - `--dry-run`: Simulate the install without making changes.
@@ -86,7 +82,7 @@ gaap remove <package-name>
 
 ### GitHub Interaction
 
-- Use GitHub’s REST API for fetching releases.
+- Use GitHub's REST API for fetching releases.
 - For unauthenticated users, ensure rate-limiting safety (up to 60 requests per hour).
 - Future: Add support for OAuth tokens for higher request limits.
 
@@ -121,25 +117,12 @@ The GAAP codebase will prioritize testability as a core principle. This involves
 - Systematic integrity checks to identify and resolve discrepancies between stored metadata and the actual state of installed packages. Tests will cover edge cases, such as manual file system changes and how the tool behaves with them.
 - Fuzz testing will be employed to test various functions and inputs comprehensively. Inputs will be fuzzed to ensure robustness against unexpected or malformed data.
 
-### User Management
-
-GAAP will create a dedicated system user named `gaap` to manage its application directory (`~/gaap/`) and its contents. This ensures a secure, isolated environment for package management operations. The `gaap` user will:
-
-- Own the `~/gaap/` directory and all subdirectories.
-- Restrict write permissions to the `gaap` user, ensuring other users cannot modify critical files or configurations.
-- Allow execution permissions for binaries within `~/gaap/bin` to all users.
-- Be automatically created during GAAP’s installation or initialization process. If the `gaap` user already exists, the application will validate and configure permissions accordingly.
-- Handle file system operations with built-in robustness to detect and resolve permission mismatches.
-
-This approach ensures a secure and consistent setup across all environments, minimizing risks of accidental modifications or security breaches.
-
 ## Key Considerations
 
 - **Non-interactive Mode**: Ensure robustness for automation pipelines.
 - **Extensibility**: Design APIs and data structures to easily support the later addition of source builds.
 - **Error Handling**: Keep errors localized to ensure predictable behavior.
 - **Backups**: Keep backups of the metadata database.
-- **Permissions**: The `gaap` user will be responsible for managing the application directory securely.
 - **Dry Run Smartness**: Ensure dry-run mode is available and logs detailed, actionable information for every subcommand.
 - **Fuzzy Finding**: Apply fuzzy matching techniques for user-friendly and flexible command inputs, ensuring consistent and accurate results.
 - **Fuzz Testing**: Incorporate fuzz testing to validate the robustness of individual components against unexpected or malformed inputs.

@@ -12,6 +12,7 @@ import (
 	"github.com/dikkadev/gaap/pkg/config"
 	"github.com/dikkadev/gaap/pkg/github"
 	"github.com/dikkadev/gaap/pkg/installer"
+	"github.com/dikkadev/gaap/pkg/selector"
 	"github.com/dikkadev/gaap/pkg/storage"
 )
 
@@ -48,6 +49,9 @@ func run(args []string) error {
 	cmd := args[0]
 	cmdArgs := args[1:]
 
+	// Create context
+	ctx := context.Background()
+
 	// Load configuration (but don't require database for help)
 	cfg, err := config.Load()
 	if err != nil {
@@ -63,6 +67,20 @@ func run(args []string) error {
 		return handleConfigure(cfg)
 	}
 
+	// Set up storage
+	store, err := storage.NewLibSQL(fmt.Sprintf("file:%s", filepath.Join(cfg.GetDirectories().DB, "gaap.db")))
+	if err != nil {
+		return fmt.Errorf("failed to set up storage: %w", err)
+	}
+	defer store.Close()
+
+	if err = store.Initialize(ctx); err != nil {
+		return fmt.Errorf("failed to initialize storage: %w", err)
+	}
+
+	// Set up GitHub client
+	ghClient := github.NewClient(cfg.GitHubToken)
+
 	// Set up command flags
 	installCmd := flag.NewFlagSet("install", flag.ExitOnError)
 	installCmd.Usage = func() {
@@ -71,15 +89,15 @@ func run(args []string) error {
 Install a package from GitHub releases.
 
 Flags:
-  -non-interactive  Run in non-interactive mode
-  -freeze          Freeze the package version
   -dry-run         Show what would be done without making changes
+  -non-interactive Run in non-interactive mode
+  -freeze          Freeze the package version
   -help            Show this help message
 `)
 	}
+	installDryRun := installCmd.Bool("dry-run", false, "Show what would be done without making changes")
 	installNonInteractive := installCmd.Bool("non-interactive", false, "Run in non-interactive mode")
 	installFreeze := installCmd.Bool("freeze", false, "Freeze the package version")
-	installDryRun := installCmd.Bool("dry-run", false, "Show what would be done without making changes")
 	installHelp := installCmd.Bool("help", false, "Show help for install command")
 
 	updateCmd := flag.NewFlagSet("update", flag.ExitOnError)
@@ -91,10 +109,12 @@ Frozen packages will be skipped unless explicitly specified.
 
 Flags:
   -dry-run         Show what would be done without making changes
+  -build           Include source-built packages (not implemented yet)
   -help            Show this help message
 `)
 	}
 	updateDryRun := updateCmd.Bool("dry-run", false, "Show what would be done without making changes")
+	updateBuild := updateCmd.Bool("build", false, "Include source-built packages (not implemented yet)")
 	updateHelp := updateCmd.Bool("help", false, "Show help for update command")
 
 	removeCmd := flag.NewFlagSet("remove", flag.ExitOnError)
@@ -123,81 +143,58 @@ Flags:
 	}
 	listHelp := listCmd.Bool("help", false, "Show help for list command")
 
-	// Parse command specific flags and handle help
+	// Handle commands
 	switch cmd {
 	case "install":
-		installCmd.Parse(cmdArgs)
+		if err = installCmd.Parse(cmdArgs); err != nil {
+			return err
+		}
 		if *installHelp {
 			installCmd.Usage()
 			return nil
 		}
+		if len(installCmd.Args()) != 1 {
+			return fmt.Errorf("install requires exactly one argument (owner/repo)")
+		}
+		return handleInstall(ctx, installCmd.Args(), cfg, store, ghClient, installer.Options{
+			DryRun:         *installDryRun,
+			NonInteractive: *installNonInteractive,
+			Freeze:         *installFreeze,
+		})
 	case "update":
-		updateCmd.Parse(cmdArgs)
+		if err = updateCmd.Parse(cmdArgs); err != nil {
+			return err
+		}
 		if *updateHelp {
 			updateCmd.Usage()
 			return nil
 		}
+		if *updateBuild {
+			fmt.Println("Warning: The --build flag is not implemented yet. Proceeding with normal update.")
+		}
+		return handleUpdate(ctx, updateCmd.Args(), cfg, store, ghClient, installer.Options{
+			DryRun: *updateDryRun,
+		})
 	case "remove":
-		removeCmd.Parse(cmdArgs)
+		if err = removeCmd.Parse(cmdArgs); err != nil {
+			return err
+		}
 		if *removeHelp {
 			removeCmd.Usage()
 			return nil
 		}
+		return handleRemove(ctx, removeCmd.Args(), cfg, store, installer.Options{
+			DryRun: *removeDryRun,
+		})
 	case "list":
-		listCmd.Parse(cmdArgs)
+		if err = listCmd.Parse(cmdArgs); err != nil {
+			return err
+		}
 		if *listHelp {
 			listCmd.Usage()
 			return nil
 		}
-	}
-
-	// Ensure GAAP directories exist
-	if err := cfg.EnsureDirectories(); err != nil {
-		return fmt.Errorf("failed to ensure directories: %w", err)
-	}
-
-	// Initialize storage
-	dirs := cfg.GetDirectories()
-	dbPath := filepath.Join(dirs.DB, "gaap.db")
-	store, err := storage.NewLibSQL("file:" + dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to initialize storage: %w", err)
-	}
-	defer store.Close()
-
-	if err := store.Initialize(context.Background()); err != nil {
-		return fmt.Errorf("failed to initialize database: %w", err)
-	}
-
-	// Create GitHub client
-	ghClient := github.NewClient(cfg.GitHubToken)
-
-	// Execute command
-	ctx := context.Background()
-	switch cmd {
-	case "install":
-		opts := installer.Options{
-			NonInteractive: *installNonInteractive,
-			Freeze:         *installFreeze,
-			DryRun:         *installDryRun,
-		}
-		return handleInstall(ctx, installCmd.Args(), cfg, store, ghClient, opts)
-
-	case "update":
-		opts := installer.Options{
-			DryRun: *updateDryRun,
-		}
-		return handleUpdate(ctx, updateCmd.Args(), cfg, store, ghClient, opts)
-
-	case "remove":
-		opts := installer.Options{
-			DryRun: *removeDryRun,
-		}
-		return handleRemove(ctx, removeCmd.Args(), cfg, store, opts)
-
-	case "list":
 		return handleList(ctx, store)
-
 	default:
 		return fmt.Errorf("unknown command: %s", cmd)
 	}
@@ -208,7 +205,16 @@ func handleInstall(ctx context.Context, args []string, cfg *config.Config, store
 		return fmt.Errorf("package name required")
 	}
 
-	return installer.Install(ctx, args[0], cfg, store, ghClient, opts)
+	// Use the selector to find the repository
+	repo, err := selector.SelectRepository(ctx, ghClient, args[0])
+	if err != nil {
+		return fmt.Errorf("failed to select repository: %w", err)
+	}
+
+	// Construct the full repository name
+	repoName := fmt.Sprintf("%s/%s", repo.Owner.Login, repo.Name)
+
+	return installer.Install(ctx, repoName, cfg, store, ghClient, opts)
 }
 
 func handleUpdate(ctx context.Context, args []string, cfg *config.Config, store storage.Storage, ghClient github.Client, opts installer.Options) error {

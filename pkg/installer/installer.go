@@ -4,37 +4,67 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/dikkadev/gaap/pkg/config"
 	"github.com/dikkadev/gaap/pkg/github"
+	"github.com/dikkadev/gaap/pkg/platform"
 	"github.com/dikkadev/gaap/pkg/storage"
 )
 
-// Options represents installation options
 type Options struct {
 	NonInteractive bool
 	Freeze         bool
 	DryRun         bool
 }
 
-// Install installs a package from GitHub
-func Install(ctx context.Context, repoPath string, cfg *config.Config, store storage.Storage, ghClient github.Client, opts Options) error {
-	// Parse repository path (owner/repo)
-	parts := strings.Split(repoPath, "/")
+func ensureDir(dir string) error {
+	// Try to create directory normally first
+	err := os.MkdirAll(dir, 0755)
+	if err == nil {
+		return nil
+	}
+
+	// If normal creation fails, try with sudo
+	cmd := exec.Command("sudo", "mkdir", "-p", dir)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to create directory with sudo: %w", err)
+	}
+
+	// Set permissions
+	cmd = exec.Command("sudo", "chown", "-R", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), dir)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to set permissions with sudo: %w", err)
+	}
+
+	return nil
+}
+
+func Install(ctx context.Context, repoName string, cfg *config.Config, store storage.Storage, ghClient github.Client, opts Options) error {
+	// Parse repository name
+	parts := strings.Split(repoName, "/")
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid repository path: %s (expected format: owner/repo)", repoPath)
+		return fmt.Errorf("invalid repository name: %s (expected format: owner/repo)", repoName)
 	}
 	owner, repo := parts[0], parts[1]
 
 	// Check if package is already installed
-	existing, err := store.GetPackage(ctx, owner, repo)
+	pkg, err := store.GetPackage(ctx, owner, repo)
 	if err != nil {
-		return fmt.Errorf("failed to check existing package: %w", err)
+		return fmt.Errorf("failed to check if package is installed: %w", err)
 	}
-	if existing != nil {
+	if pkg != nil {
 		return fmt.Errorf("package %s/%s is already installed", owner, repo)
+	}
+
+	// If in dry-run mode, just print what would be done
+	if opts.DryRun {
+		dirs := cfg.GetDirectories()
+		fmt.Printf("Would install package: %s/%s\n", owner, repo)
+		fmt.Printf("Target directory: %s\n", dirs.Bin)
+		return nil
 	}
 
 	// Get latest release
@@ -43,162 +73,230 @@ func Install(ctx context.Context, repoPath string, cfg *config.Config, store sto
 		return fmt.Errorf("failed to get latest release: %w", err)
 	}
 
-	if len(release.Assets) == 0 {
-		return fmt.Errorf("no assets found in the latest release")
+	// Select appropriate asset for current platform
+	plat := platform.Current()
+	asset, err := plat.SelectAsset(release.Assets)
+	if err != nil {
+		return fmt.Errorf("failed to select asset: %w", err)
 	}
 
-	// TODO: Implement asset selection based on OS/arch
-	asset := release.Assets[0]
+	// In non-interactive mode, proceed without confirmation
+	if !opts.NonInteractive {
+		fmt.Printf("Installing %s/%s version %s\n", owner, repo, release.TagName)
+		fmt.Printf("Asset: %s\n", asset.Name)
+		fmt.Print("Proceed? [Y/n]: ")
 
-	// Prepare installation paths
+		var response string
+		fmt.Scanln(&response)
+		if response != "" && strings.ToLower(response) != "y" {
+			return fmt.Errorf("installation cancelled by user")
+		}
+	}
+
+	// Create unique binary name
+	binaryName := fmt.Sprintf("%s-%s-%s", owner, repo, release.TagName)
+	if strings.HasSuffix(strings.ToLower(asset.Name), ".exe") {
+		binaryName += ".exe"
+	}
+
+	// Get directories
 	dirs := cfg.GetDirectories()
-	binaryName := strings.TrimSuffix(asset.Name, filepath.Ext(asset.Name))
-	actualPath := filepath.Join(dirs.BinActual, fmt.Sprintf("%s-%s-%s", owner, repo, release.TagName))
-	symlinkPath := filepath.Join(dirs.Bin, binaryName)
 
-	if opts.DryRun {
-		fmt.Printf("Would install %s/%s@%s:\n", owner, repo, release.TagName)
-		fmt.Printf("  Asset: %s\n", asset.Name)
-		fmt.Printf("  Binary: %s\n", actualPath)
-		fmt.Printf("  Symlink: %s\n", symlinkPath)
-		return nil
+	// Ensure directories exist
+	if err := ensureDir(dirs.BinActual); err != nil {
+		return fmt.Errorf("failed to create bin directory: %w", err)
+	}
+	if err := ensureDir(dirs.Bin); err != nil {
+		return fmt.Errorf("failed to create symlink directory: %w", err)
 	}
 
-	// Download the asset
-	if err := ghClient.DownloadAsset(ctx, asset.DownloadURL, actualPath); err != nil {
-		return fmt.Errorf("failed to download asset: %w", err)
+	binaryPath := filepath.Join(dirs.BinActual, binaryName)
+	symlinkPath := filepath.Join(dirs.Bin, repo)
+	if platform.Current().OS == "windows" {
+		symlinkPath += ".exe"
 	}
 
-	// Make the binary executable
-	if err := os.Chmod(actualPath, 0755); err != nil {
-		return fmt.Errorf("failed to make binary executable: %w", err)
-	}
+	// Download asset
+	if !opts.DryRun {
+		if err := ghClient.DownloadAsset(ctx, asset, binaryPath); err != nil {
+			return fmt.Errorf("failed to download asset: %w", err)
+		}
 
-	// Create symlink
-	if err := os.Symlink(actualPath, symlinkPath); err != nil {
-		os.Remove(actualPath) // Clean up on error
-		return fmt.Errorf("failed to create symlink: %w", err)
-	}
+		// Make binary executable
+		if err := os.Chmod(binaryPath, 0755); err != nil {
+			return fmt.Errorf("failed to make binary executable: %w", err)
+		}
 
-	// Add to database
-	pkg := &storage.Package{
-		Owner:       owner,
-		Repo:        repo,
-		Version:     release.TagName,
-		InstallPath: actualPath,
-		BinaryName:  binaryName,
-		Frozen:      opts.Freeze,
-	}
+		// Create symlink
+		if err := os.Symlink(binaryPath, symlinkPath); err != nil {
+			// Clean up on failure
+			os.Remove(binaryPath)
+			return fmt.Errorf("failed to create symlink: %w", err)
+		}
 
-	if err := store.AddPackage(ctx, pkg); err != nil {
-		os.Remove(symlinkPath) // Clean up on error
-		os.Remove(actualPath)
-		return fmt.Errorf("failed to add package to database: %w", err)
+		// Store package information with freeze status
+		pkg = &storage.Package{
+			Owner:    owner,
+			Repo:     repo,
+			Version:  release.TagName,
+			Binary:   binaryName,
+			Frozen:   opts.Freeze,
+			Platform: plat.String(),
+		}
+		if err := store.AddPackage(ctx, pkg); err != nil {
+			// Clean up on failure
+			os.Remove(symlinkPath)
+			os.Remove(binaryPath)
+			return fmt.Errorf("failed to add package to database: %w", err)
+		}
 	}
 
 	fmt.Printf("Successfully installed %s/%s@%s\n", owner, repo, release.TagName)
+	if opts.Freeze {
+		fmt.Printf("Package version is frozen at %s\n", release.TagName)
+	}
 	return nil
 }
 
-// Update updates an installed package
 func Update(ctx context.Context, pkg *storage.Package, cfg *config.Config, store storage.Storage, ghClient github.Client, opts Options) error {
+	// Skip frozen packages unless explicitly unfrozen
+	if pkg.Frozen {
+		fmt.Printf("Skipping frozen package %s/%s@%s\n", pkg.Owner, pkg.Repo, pkg.Version)
+		return nil
+	}
+
+	// Get directories
+	dirs := cfg.GetDirectories()
+
+	// If in dry-run mode, just print what would be done
+	if opts.DryRun {
+		fmt.Printf("Would update package: %s/%s\n", pkg.Owner, pkg.Repo)
+		return nil
+	}
+
 	// Get latest release
 	release, err := ghClient.GetLatestRelease(ctx, pkg.Owner, pkg.Repo)
 	if err != nil {
 		return fmt.Errorf("failed to get latest release: %w", err)
 	}
 
-	// Check if update is needed
+	// Skip if already at latest version
 	if release.TagName == pkg.Version {
-		fmt.Printf("%s/%s is already at the latest version (%s)\n", pkg.Owner, pkg.Repo, pkg.Version)
+		fmt.Printf("Package %s/%s is already at latest version %s\n", pkg.Owner, pkg.Repo, pkg.Version)
 		return nil
 	}
 
-	if len(release.Assets) == 0 {
-		return fmt.Errorf("no assets found in the latest release")
+	// Select appropriate asset for current platform
+	plat := platform.Current()
+	asset, err := plat.SelectAsset(release.Assets)
+	if err != nil {
+		return fmt.Errorf("failed to select asset: %w", err)
 	}
 
-	// TODO: Implement asset selection based on OS/arch
-	asset := release.Assets[0]
+	// In non-interactive mode, proceed without confirmation
+	if !opts.NonInteractive {
+		fmt.Printf("Updating %s/%s from %s to %s\n", pkg.Owner, pkg.Repo, pkg.Version, release.TagName)
+		fmt.Printf("Asset: %s\n", asset.Name)
+		fmt.Print("Proceed? [Y/n]: ")
 
-	// Prepare installation paths
-	dirs := cfg.GetDirectories()
-	binaryName := pkg.BinaryName
-	actualPath := filepath.Join(dirs.BinActual, fmt.Sprintf("%s-%s-%s", pkg.Owner, pkg.Repo, release.TagName))
-	symlinkPath := filepath.Join(dirs.Bin, binaryName)
-
-	if opts.DryRun {
-		fmt.Printf("Would update %s/%s from %s to %s:\n", pkg.Owner, pkg.Repo, pkg.Version, release.TagName)
-		fmt.Printf("  Asset: %s\n", asset.Name)
-		fmt.Printf("  Binary: %s\n", actualPath)
-		fmt.Printf("  Symlink: %s\n", symlinkPath)
-		return nil
+		var response string
+		fmt.Scanln(&response)
+		if response != "" && strings.ToLower(response) != "y" {
+			return fmt.Errorf("update cancelled by user")
+		}
 	}
 
-	// Download the new version
-	if err := ghClient.DownloadAsset(ctx, asset.DownloadURL, actualPath); err != nil {
-		return fmt.Errorf("failed to download asset: %w", err)
+	// Create unique binary name
+	binaryName := fmt.Sprintf("%s-%s-%s", pkg.Owner, pkg.Repo, release.TagName)
+	if strings.HasSuffix(strings.ToLower(asset.Name), ".exe") {
+		binaryName += ".exe"
 	}
 
-	// Make the binary executable
-	if err := os.Chmod(actualPath, 0755); err != nil {
-		os.Remove(actualPath) // Clean up on error
-		return fmt.Errorf("failed to make binary executable: %w", err)
+	// Ensure directories exist
+	if err := ensureDir(dirs.BinActual); err != nil {
+		return fmt.Errorf("failed to create bin directory: %w", err)
+	}
+	if err := ensureDir(dirs.Bin); err != nil {
+		return fmt.Errorf("failed to create symlink directory: %w", err)
 	}
 
-	// Update symlink
-	tmpSymlink := symlinkPath + ".tmp"
-	if err := os.Symlink(actualPath, tmpSymlink); err != nil {
-		os.Remove(actualPath) // Clean up on error
-		return fmt.Errorf("failed to create temporary symlink: %w", err)
+	oldBinaryPath := filepath.Join(dirs.BinActual, pkg.Binary)
+	newBinaryPath := filepath.Join(dirs.BinActual, binaryName)
+	symlinkPath := filepath.Join(dirs.Bin, pkg.Repo)
+	if plat.OS == "windows" {
+		symlinkPath += ".exe"
 	}
 
-	if err := os.Rename(tmpSymlink, symlinkPath); err != nil {
-		os.Remove(tmpSymlink) // Clean up on error
-		os.Remove(actualPath)
-		return fmt.Errorf("failed to update symlink: %w", err)
+	if !opts.DryRun {
+		// Download new version
+		if err := ghClient.DownloadAsset(ctx, asset, newBinaryPath); err != nil {
+			return fmt.Errorf("failed to download asset: %w", err)
+		}
+
+		// Make binary executable
+		if err := os.Chmod(newBinaryPath, 0755); err != nil {
+			os.Remove(newBinaryPath)
+			return fmt.Errorf("failed to make binary executable: %w", err)
+		}
+
+		// Update symlink
+		if err := os.Remove(symlinkPath); err != nil {
+			os.Remove(newBinaryPath)
+			return fmt.Errorf("failed to remove old symlink: %w", err)
+		}
+		if err := os.Symlink(newBinaryPath, symlinkPath); err != nil {
+			os.Remove(newBinaryPath)
+			return fmt.Errorf("failed to create new symlink: %w", err)
+		}
+
+		// Update database
+		pkg.Version = release.TagName
+		pkg.Binary = binaryName
+		pkg.Platform = plat.String()
+		if err := store.UpdatePackage(ctx, pkg); err != nil {
+			os.Remove(symlinkPath)
+			os.Remove(newBinaryPath)
+			return fmt.Errorf("failed to update package in database: %w", err)
+		}
+
+		// Remove old binary
+		os.Remove(oldBinaryPath)
 	}
 
-	// Remove old binary
-	os.Remove(pkg.InstallPath) // Ignore error, as the file might be in use
-
-	// Update database
-	pkg.Version = release.TagName
-	pkg.InstallPath = actualPath
-
-	if err := store.UpdatePackage(ctx, pkg); err != nil {
-		return fmt.Errorf("failed to update package in database: %w", err)
-	}
-
-	fmt.Printf("Successfully updated %s/%s to %s\n", pkg.Owner, pkg.Repo, release.TagName)
+	fmt.Printf("Successfully updated %s/%s from %s to %s\n", pkg.Owner, pkg.Repo, pkg.Version, release.TagName)
 	return nil
 }
 
-// Remove removes an installed package
 func Remove(ctx context.Context, pkg *storage.Package, cfg *config.Config, store storage.Storage, opts Options) error {
+	// Get directories
 	dirs := cfg.GetDirectories()
-	symlinkPath := filepath.Join(dirs.Bin, pkg.BinaryName)
 
+	// If in dry-run mode, just print what would be done
 	if opts.DryRun {
-		fmt.Printf("Would remove %s/%s@%s:\n", pkg.Owner, pkg.Repo, pkg.Version)
-		fmt.Printf("  Binary: %s\n", pkg.InstallPath)
-		fmt.Printf("  Symlink: %s\n", symlinkPath)
+		fmt.Printf("Would remove package: %s/%s\n", pkg.Owner, pkg.Repo)
 		return nil
 	}
 
-	// Remove from database first
-	if err := store.DeletePackage(ctx, pkg.Owner, pkg.Repo); err != nil {
-		return fmt.Errorf("failed to remove package from database: %w", err)
+	// Remove binary and symlink
+	binaryPath := filepath.Join(dirs.BinActual, pkg.Binary)
+	symlinkPath := filepath.Join(dirs.Bin, pkg.Repo)
+	if platform.Current().OS == "windows" {
+		symlinkPath += ".exe"
 	}
 
-	// Remove symlink
+	// Remove symlink first
 	if err := os.Remove(symlinkPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove symlink: %w", err)
 	}
 
-	// Remove binary
-	if err := os.Remove(pkg.InstallPath); err != nil && !os.IsNotExist(err) {
+	// Then remove binary
+	if err := os.Remove(binaryPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove binary: %w", err)
+	}
+
+	// Finally remove from database
+	if err := store.DeletePackage(ctx, pkg.Owner, pkg.Repo); err != nil {
+		return fmt.Errorf("failed to remove package from database: %w", err)
 	}
 
 	fmt.Printf("Successfully removed %s/%s\n", pkg.Owner, pkg.Repo)
