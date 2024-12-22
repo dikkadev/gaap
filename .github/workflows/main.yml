@@ -1,0 +1,11 @@
+name: Main
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  verify:
+    uses: ./.github/workflows/test.yml
+    with:
+      run-e2e: false  # Only run unit tests

@@ -1,0 +1,18 @@
+name: Release Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  verify:
+    uses: ./.github/workflows/test.yml
+    with:
+      run-e2e: true  # Run all tests before release
+  
+  release:
+    needs: verify
+    uses: ./.github/workflows/release.yml
+    with:
+      publish: true  # Create GitHub release 

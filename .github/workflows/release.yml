@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: 'Whether to publish the release'
+        required: false
+        type: boolean
+        default: false
+      go-version:
+        description: 'Go version to use'
+        required: false
+        type: string
+        default: '>=1.21.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: windows # Windows not supported by libsql
+            arch: amd64
+            suffix: .exe
+          - os: windows
+            arch: '386'
+            suffix: .exe
+          - os: darwin
+            arch: amd64
+            suffix: ''
+          - os: darwin
+            arch: arm64
+            suffix: ''
+          - os: linux
+            arch: amd64
+            suffix: ''
+          - os: linux
+            arch: '386'
+            suffix: ''
+          - os: linux
+            arch: arm64
+            suffix: ''
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+      
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p release
+          go build -v -o release/gaap-${GITHUB_REF_NAME:-dev}-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.suffix }} ./cmd/gaap
+      
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: binaries
+          path: release/*
+          if-no-files-found: error
+  
+  publish:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: binaries
+          path: release
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/dikkadev/gaap/pkg/config"
@@ -748,6 +751,22 @@ func TestUpdateErrors(t *testing.T) {
 }
 
 func TestRemoveErrors(t *testing.T) {
+	// If running as root (in CI), drop privileges at the start
+	if os.Geteuid() == 0 {
+		uid := 1000
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			if u, err := user.Lookup(sudoUser); err == nil {
+				if parsedUID, err := strconv.Atoi(u.Uid); err == nil {
+					uid = parsedUID
+				}
+			}
+		}
+		t.Logf("Dropping root privileges to uid %d", uid)
+		if err := syscall.Setreuid(uid, uid); err != nil {
+			t.Fatalf("Failed to drop privileges: %v", err)
+		}
+	}
+
 	testCases := []struct {
 		name        string
 		pkg         *storage.Package
@@ -785,16 +804,23 @@ func TestRemoveErrors(t *testing.T) {
 			},
 			setupFunc: func(cfg *config.Config) error {
 				dirs := cfg.GetDirectories()
-				// Create directory with write permissions first
+
+				// Create directory and binary with write permissions first
 				if err := os.MkdirAll(dirs.BinActual, 0755); err != nil {
-					return err
+					return fmt.Errorf("failed to create BinActual dir: %v", err)
 				}
-				// Create test file
-				if err := os.WriteFile(filepath.Join(dirs.BinActual, "test-binary"), []byte("test"), 0444); err != nil {
-					return err
+
+				binPath := filepath.Join(dirs.BinActual, "test-binary")
+				if err := os.WriteFile(binPath, []byte("test"), 0444); err != nil {
+					return fmt.Errorf("failed to create test binary: %v", err)
 				}
-				// Make directory read-only after creating file
-				return os.Chmod(dirs.BinActual, 0555)
+
+				// Make BinActual directory read-only
+				if err := os.Chmod(dirs.BinActual, 0555); err != nil {
+					return fmt.Errorf("failed to chmod BinActual: %v", err)
+				}
+
+				return nil
 			},
 			wantErr:     true,
 			errContains: "failed to remove binary",
@@ -813,13 +839,14 @@ func TestRemoveErrors(t *testing.T) {
 			}
 
 			err := Remove(context.Background(), tc.pkg, cfg, store, Options{})
+			t.Logf("Test case %q: err = %v", tc.name, err)
 			if !tc.wantErr && err != nil {
 				t.Errorf("Remove() unexpected error: %v", err)
 			}
 			if tc.wantErr && err == nil {
 				t.Error("Remove() expected error but got none")
 			}
-			if tc.wantErr && !strings.Contains(err.Error(), tc.errContains) {
+			if tc.wantErr && err != nil && !strings.Contains(err.Error(), tc.errContains) {
 				t.Errorf("Remove() error = %v, want error containing %v", err, tc.errContains)
 			}
 

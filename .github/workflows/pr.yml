@@ -1,0 +1,12 @@
+name: Pull Request
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  verify:
+    uses: ./.github/workflows/test.yml
+    with:
+      run-e2e: true  # Run both unit and E2E tests

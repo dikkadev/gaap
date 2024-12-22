@@ -1,0 +1,16 @@
+{
+    "ref": "refs/tags/v1.0.0",
+    "repository": {
+      "name": "gaap",
+      "full_name": "dikkadev/gaap",
+      "private": false,
+      "owner": {
+        "name": "dikkadev",
+        "email": "test@example.com"
+      }
+    },
+    "pusher": {
+      "name": "dikkadev",
+      "email": "test@example.com"
+    }
+  }
