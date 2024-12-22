@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/tursodatabase/go-libsql"
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
+	_ "modernc.org/sqlite"
 )
 
 // LibSQL implements the Storage interface using libsql
